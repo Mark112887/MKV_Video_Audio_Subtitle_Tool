@@ -16,10 +16,10 @@ A desktop application for batch-processing MKV video files — changing display 
 
 This tool is designed for users who need to quickly remux MKV files to:
 
-- **:framed_picture:** Set a specific display aspect ratio (DAR) — e.g. `16:9`, `4:3`, `2.35:1` — so media players render the video with the correct pixel aspect.
-- **:no_bell:** Remove embedded subtitles that clutter the playback interface.
+- :art: Set a specific display aspect ratio (DAR) — e.g. `16:9`, `4:3`, `2.35:1` — so media players render the video with the correct pixel aspect.
+- :loud_sound: Remove embedded subtitles that clutter the playback interface.
 - :musical_note: Keep only one audio track (useful when a file contains multiple languages and you want to strip extras).
-- :wastebasket: Delete original source files after successful processing, freeing up disk space automatically.
+- :recycle: Delete original source files after successful processing, freeing up disk space automatically.
 
 Everything runs locally on your machine — **no re-encoding** means processing is fast and quality lossless.
 
@@ -31,38 +31,38 @@ Everything runs locally on your machine — **no re-encoding** means processing 
 
 | Feature | Description |
 |---------|-------------|
-| **:framed_picture: Aspect Ratio Conversion** | Set any display aspect ratio (DAR) using the `W:H` or `W/H` format (e.g., `16:9`, `4/3`, `2.35:1`). The tool writes `display-width`, `display-height`, and `display-unit` metadata into the MKV container via `mkvpropedit`. |
-| **:no_bell: Subtitle Removal** | Strip all subtitle tracks from one or more MKV files with a single checkbox. Uses mkvmerge's `-S` flag to remove subtitles during remuxing. |
-| **:wastebasket: Delete Original Files** | Check a box before processing and the original source file(s) are deleted after successful remuxing, freeing up disk space. Available in both Batch and Individual modes with per-file granularity. |
+| :art: **Aspect Ratio Conversion** | Set any display aspect ratio (DAR) using the `W:H` or `W/H` format (e.g., `16:9`, `4/3`, `2.35:1`). The tool writes `display-width`, `display-height`, and `display-unit` metadata into the MKV container via `mkvpropedit`. |
+| :loud_sound: **Subtitle Removal** | Strip all subtitle tracks from one or more MKV files with a single checkbox. Uses mkvmerge's `-S` flag to remove subtitles during remuxing. |
+| :recycle: **Delete Original Files** | Check a box before processing and the original source file(s) are deleted after successful remuxing, freeing up disk space. Available in both Batch and Individual modes with per-file granularity. |
 | :musical_note: **Audio Track Filtering** | Keep only a single audio track while discarding all others. A dropdown auto-populates after loading an MKV file, showing each track's language (via IETF BCP 47 codes mapped to full names through ISO 639-1 lookup) and track ID. Selecting "Keep All" leaves every audio track untouched. |
 | :repeat: **Batch Processing** | Drag-and-drop an entire folder of MKV files (or a single file) and process them all in one go. The progress bar shows live percentage updates as each file completes. |
-| :crosshairs: **Per-File Override Mode** | Switch to "Individual" mode to customize DAR, audio track, and subtitle settings for each file independently. Click any file name in the list to load its saved settings; toggle the Batch/Individual switch to revert to global defaults. |
+| :arrow_right: **Per-File Override Mode** | Switch to "Individual" mode to customize DAR, audio track, and subtitle settings for each file independently. Click any file name in the list to load its saved settings; toggle the Batch/Individual switch to revert to global defaults. |
 
 ### :computer: User Interface
 
-- **:black_heart:** Dark theme — easy on the eyes for extended use.
+- :black_heart: **Dark theme** — easy on the eyes for extended use.
 - :clipboard: **Drag-and-drop support** — drop MKV files or folders directly onto the blue drop zone at the top of the window.
 - :floppy_disk: **Persistent output folder** — remembers your last chosen output location across launches.
-- :chart_increasing: **Live progress feedback** — a blue animated progress bar with a percentage overlay shows real-time processing status for each file.
-- :mouse_pointer: **Clickable file list** — each entry displays a color-coded status tag (green = custom per-file settings, blue = global default, yellow-green highlight = selected).
+- :bar_chart: **Live progress feedback** — a blue animated progress bar with a percentage overlay shows real-time processing status for each file.
+- :point_right: **Clickable file list** — each entry displays a color-coded status tag (green = custom per-file settings, blue = global default, yellow-green highlight = selected).
 
 ### :gear: Technical Details
 
 | Detail | Description |
 |--------|-------------|
-| **:wrench: Backend** | Uses mkvtoolnix utilities (mkvmerge, mkvpropedit, mkvinfo) — bundled with the app so nothing extra to install. |
+| :wrench: **Backend** | Uses mkvtoolnix utilities (mkvmerge, mkvpropedit, mkvinfo) — bundled with the app so nothing extra to install. |
 | :construction: **Processing Pipeline** | Step 1: mkvmerge remuxes your content with the chosen filters (audio track deletion, subtitle removal). Step 2: mkvpropedit writes display aspect ratio metadata into the container. |
 
 ---
 
 ## :fire: Requirements
 
-- :windows: **Operating System:** Windows 10 or later (64-bit)
+- :desktop: **Operating System:** Windows 10 or later (64-bit)
 - :snake: **Python 3.11+** — only needed if building from source, not for running the pre-built EXE.
 - :package: **Pywin32** (`pip install pywin32`) — required for drag-and-drop support at runtime.
 - The three mkvtoolnix executables are bundled with the app and do **not** need to be installed separately.
 
-### :hammer: From Source (Build Instructions)
+### :construction_worker: From Source (Build Instructions)
 
 ```powershell
 # 1. Clone or download this repository
@@ -81,28 +81,28 @@ The compiled application will be in `dist/MKV Video Audio & Subtitle Tool.exe`.
 
 ### :tada: Quick Start (Pre-Built EXE)
 
-1. **:zap: Launch** `MKV Video Audio & Subtitle Tool.exe`.
-2. **:clipboard: Drop MKV files** — drag any MKV file(s) or an entire folder onto the blue drop zone at the top, or click **Browse**.
+1. :zap: **Launch** `MKV Video Audio & Subtitle Tool.exe`.
+2. :clipboard: **Drop MKV files** — drag any MKV file(s) or an entire folder onto the blue drop zone at the top, or click **Browse**.
 3. :gear: **Choose global settings:**
-   - **:framed_picture: Desired Aspect Ratio** — type a ratio like `16:9` (default), `4:3`, or `2.35:1`.
+   - :art: **Desired Aspect Ratio** — type a ratio like `16:9` (default), `4:3`, or `2.35:1`.
    - :musical_note: **Audio Track to Keep** — select "Keep All" (default) or pick a specific track from the dropdown.
-   - **:no_bell: Remove Subtitles** — check the box if you want subtitles stripped.
-   - **:wastebasket: Delete Original Files** — check the box to remove source files after successful processing (per-file in Individual mode).
+   - :loud_sound: **Remove Subtitles** — check the box if you want subtitles stripped.
+   - :recycle: **Delete Original Files** — check the box to remove source files after successful processing (per-file in Individual mode).
 4. :floppy_disk: **Choose output location** (optional) — click **Output Dir** to set where processed files will be saved. Defaults to a `Processed Files` folder next to the executable.
-5. :play_or_pause_button: **Click Process** — the batch job begins. Watch progress in the panel below.
+5. :triangular_flag_on_post: **Click Process** — the batch job begins. Watch progress in the panel below.
 
-#### :file_folder: Default Output Folder
+#### :page_facing_up: Default Output Folder
 
 When you first launch the app, it automatically creates a **`Processed Files`** folder in the same location where the executable is launched (e.g., next to `MKV Video Audio & Subtitle Tool.exe`). All processed output goes there by default unless you explicitly change the output location via **Output Dir**.
 
-### :crosshairs: Using Individual Mode
+### :art: Using Individual Mode
 
 1. Click the **Individual** tab (next to Batch) above the settings area.
 2. Click any file name in the list below — its saved settings load into the controls.
 3. Change DAR, audio track, subtitle, or delete-originals setting for that file only. Changes are saved automatically as you type or select.
 4. Switch back to **Batch** at any time to apply global defaults across all files.
 
-### :chart: Understanding Status Colors in the File List
+### :bar_chart: Understanding Status Colors in the File List
 
 | Color | Meaning |
 |-------|---------|
@@ -114,7 +114,7 @@ When you first launch the app, it automatically creates a **`Processed Files`** 
 
 During processing, each file entry shows:
 
-- **:arrows_counterclockwise: Progress counter** — `[1/3] filename.mkv …` (which file out of total)
+- :repeat: **Progress counter** — `[1/3] filename.mkv …` (which file out of total)
 - :white_check_mark: **Success** — `✓ Display Aspect Ratio Set to 16:9  Subtitles Removed: Yes  Original Deleted: Yes` or similar, depending on choices made
 - :x: **Failure** — `✗ mkvmerge.exe not found.` or other error message
 
@@ -122,7 +122,7 @@ A summary line at the end shows: `═══ complete: X ok, Y failed ═══`
 
 ---
 
-## :file_folder: File Structure
+## :page_facing_up: File Structure
 
 ```
 MKV Video Audio & Subtitle Tool/
