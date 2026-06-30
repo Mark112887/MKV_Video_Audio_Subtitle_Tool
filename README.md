@@ -146,7 +146,7 @@ Your output folder choice is saved automatically — no configuration needed. To
 
 ---
 
-## :scale_balanced: License
+## :scroll: License
 
 This project is licensed under the **GNU General Public License v3.0** (GPL-3.0). You are free to copy, distribute, and modify it under the terms of the GPL. See `LICENSE` for the full text.
 
