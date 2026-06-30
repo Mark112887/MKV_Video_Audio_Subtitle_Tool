@@ -107,7 +107,7 @@ When you first launch the app, it automatically creates a **`Processed Files`** 
 | Color | Meaning |
 |-------|---------|
 | :green_circle: Green text | This file has custom per-file settings that differ from global defaults |
-| :blue_circle: Blue text | This file uses global default settings (no individual override) |
+| :large_blue_circle: Blue text | This file uses global default settings (no individual override) |
 | :yellow_circle: Yellow-green background highlight | The currently selected file in the list |
 
 ### :wrench: Processing Output
