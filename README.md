@@ -18,7 +18,7 @@ This tool is designed for users who need to quickly remux MKV files to:
 
 - :art: Set a specific display aspect ratio (DAR) — e.g. `16:9`, `4:3`, `2.35:1` — so media players render the video with the correct pixel aspect.
 - :loud_sound: Remove embedded subtitles that clutter the playback interface.
-- :closed_caption: Strip embedded closed captions (CEA-608/708) without re-encoding.
+- 💬 Strip embedded closed captions (CEA-608/708) without re-encoding.
 - :musical_note: Keep only one audio track (useful when a file contains multiple languages and you want to strip extras).
 - :recycle: Delete original source files after successful processing, freeing up disk space automatically.
 
@@ -34,7 +34,7 @@ Everything runs locally on your machine — **no re-encoding** means processing 
 |---------|-------------|
 | :art: **Aspect Ratio Conversion** | Set any display aspect ratio (DAR) using the `W:H` or `W/H` format (e.g., `16:9`, `4/3`, `2.35:1`). The tool writes `display-width`, `display-height`, and `display-unit` metadata into the MKV container via `mkvpropedit`. |
 | :loud_sound: **Subtitle Removal** | Strip all subtitle tracks from one or more MKV files with a single checkbox. Uses mkvmerge's `-S` flag to remove subtitles during remuxing. |
-| :closed_caption: **Closed Caption Removal** | Strip embedded closed captions (CEA-608/708) from the video stream independently of subtitle removal. Uses ffmpeg's bitstream filter to strip type-6 NAL units — no re-encoding required. |
+| 💬 **Closed Caption Removal** | Strip embedded closed captions (CEA-608/708) from the video stream independently of subtitle removal. Uses ffmpeg's bitstream filter to strip type-6 NAL units — no re-encoding required. |
 | :recycle: **Delete Original Files** | Check a box before processing and the original source file(s) are deleted after successful remuxing, freeing up disk space. Available in both Batch and Individual modes with per-file granularity. |
 | :musical_note: **Audio Track Filtering** | Keep only a single audio track while discarding all others. A dropdown auto-populates after loading an MKV file, showing each track's language (via IETF BCP 47 codes mapped to full names through ISO 639-1 lookup) and track ID. Selecting "Keep All" leaves every audio track untouched. |
 | :repeat: **Batch Processing** | Drag-and-drop an entire folder of MKV files (or a single file) and process them all in one go. The progress bar shows live percentage updates as each file completes. |
@@ -89,7 +89,7 @@ The compiled application will be in `dist/MKV Video Audio & Subtitle Tool.exe`.
    - :art: **Desired Aspect Ratio** — type a ratio like `16:9` (default), `4:3`, or `2.35:1`.
    - :musical_note: **Audio Track to Keep** — select "Keep All" (default) or pick a specific track from the dropdown.
    - :loud_sound: **Remove Subtitles** — check the box if you want subtitles stripped.
-   - :closed_caption: **Remove Closed Captions** — check the box to strip embedded closed captions (CEA-608/708) from the video stream.
+   - 💬 **Remove Closed Captions** — check the box to strip embedded closed captions (CEA-608/708) from the video stream.
    - :recycle: **Delete Original Files** — check the box to remove source files after successful processing (per-file in Individual mode).
 4. :floppy_disk: **Choose output location** (optional) — click **Output Dir** to set where processed files will be saved. Defaults to a `Processed Files` folder next to the executable.
 5. :triangular_flag_on_post: **Click Process** — the batch job begins. Watch progress in the panel below.
