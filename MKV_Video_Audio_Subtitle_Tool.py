@@ -472,6 +472,20 @@ _ISO_639_1_TO_NAME = {
     'uk': 'Ukrainian',       'ur': 'Urdu',          'vi': 'Vietnamese',
 }
 
+# ISO 639-2/3 three-letter codes — maps plain mkvinfo 'Language:' values
+# that aren't IETF BCP 47 tags (which use 2-letter codes) to full names.
+_ISO_639_2_TO_NAME = {
+    'eng': 'English',      'fra': 'French',       'deu': 'German',
+    'spa': 'Spanish',       'por': 'Portuguese',   'ita': 'Italian',
+    'rus': 'Russian',       'jpn': 'Japanese',     'kor': 'Korean',
+    'zho': 'Chinese',       'ara': 'Arabic',       'hin': 'Hindi',
+    'nld': 'Dutch',         'swe': 'Swedish',      'pol': 'Polish',
+    'tur': 'Turkish',       'gre': 'Greek',        'heb': 'Hebrew',
+    'dan': 'Danish',         'fin': 'Finnish',      'nor': 'Norwegian',
+    'ces': 'Czech',         'ukr': 'Ukrainian',   'ron': 'Romanian',
+    'hun': 'Hungarian',     'ell': 'Greek',        'tha': 'Thai',
+}
+
 
 def probe_audio_tracks(mkv_path):
     """Probe an MKV file for audio tracks using mkvinfo.
@@ -525,6 +539,15 @@ def probe_audio_tracks(mkv_path):
                 m_lang = re.search(r'Language \(IETF BCP 47\):\s*(.+)', s)
                 if m_lang:
                     language = m_lang.group(1).strip()
+                # Fallback: plain 'Language:' field — mkvinfo may output
+                # either "Language:" or "[+\s]Language:" depending on version.
+                # We only match when there's no IETF BCP 47 parenthetical, and we
+                # anchor with a non-word boundary before "Language" to avoid false
+                # matches (e.g., in codec private data strings).
+                elif not language:
+                    m_lang_plain = re.search(r'(?<![a-zA-Z(])Language:\s*(.+)', s)
+                    if m_lang_plain:
+                        language = m_lang_plain.group(1).strip()
                 j += 1
 
             if track_type == 'audio':
@@ -1071,7 +1094,7 @@ class App:
         # Build options with embedded track ID as data
         options = [("Keep All", None)]  # (display_label, audio_index)
         for track in audio_tracks:
-            lang = track.get('language', '').lower() or ''
+            lang = (track.get('language') or '').lower()
             tid = track.get('id')
 
             if not lang or lang in ('und', 'unk'):
@@ -1080,7 +1103,9 @@ class App:
                 # Look up ISO 639-1 code → full name; fall back to uppercase if unknown
                 display = f"Track #{tid} ({_ISO_639_1_TO_NAME.get(lang, lang.upper())})"
             else:
-                display = f"Track #{tid} ({lang})"
+                # Try 3-letter ISO 639-2/3 mapping first; fall back to showing raw code
+                name = (_ISO_639_2_TO_NAME.get(lang) or lang.title()) if len(lang) == 3 else lang.upper()
+                display = f"Track #{tid} ({name})"
 
             options.append((display, tid))
 
