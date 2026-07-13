@@ -162,6 +162,11 @@ def _get_mkvpropedit():
     return _mkv_exe('mkvpropedit')
 
 
+def _get_ffmpeg():
+    """Return the path to ffmpeg.exe or None."""
+    return _mkv_exe('ffmpeg')
+
+
 def run_mkvtl(args, timeout=300):
     """Run an mkvtoolnix tool; returns (returncode, combined_text).
 
@@ -275,11 +280,12 @@ def _debug_write(msg):
         pass  # don't crash logging
 
 
-def process_mkv(mkv_path, output_dir, dar_str="16:9", remove_subs=True, audio_sel=None, delete_original=False):
+def process_mkv(mkv_path, output_dir, dar_str="16:9", remove_subs=True, remove_cc=False, audio_sel=None, delete_original=False):
     """Process one MKV — set DAR via mkvmerge + mkvpropedit.  Returns (ok, msg).
 
     *audio_sel*: None = keep all audio tracks; int = only keep this track ID.
     *delete_original*: True = remove the source file after successful processing.
+    *remove_cc*: True = strip closed captions via ffmpeg bitstream filter.
     """
     _debug_write(f"=== START processing {mkv_path}")
     _debug_write(f"  output_dir={output_dir}  dar={dar_str}  remove_subs={remove_subs}")
@@ -335,6 +341,39 @@ def process_mkv(mkv_path, output_dir, dar_str="16:9", remove_subs=True, audio_se
 
     file_size = os.path.getsize(output_path) / (1024 * 1024)
     _debug_write(f"  mkvmerge OK — output created ({file_size:.1f} MB)")
+
+    # ── Step 1b — ffmpeg: strip closed captions (CEA-608/708, type-6 NAL units) ─
+    if remove_cc:
+        _debug_write(f"  Stripping closed captions via ffmpeg")
+        cc_path = output_path.rsplit('.', 1)[0] + '_cc.mkv'
+        ffmpeg = _get_ffmpeg()
+        if ffmpeg is None:
+            msg = "ffmpeg.exe not found."
+            _debug_write(f"  FAIL: {msg}")
+            os.remove(output_path)
+            return False, msg
+
+        cc_cmd = [ffmpeg, '-i', output_path, '-codec', 'copy',
+                   '-bsf:v', 'filter_units=remove_types=6', cc_path]
+        rc_cc, out_cc = run_mkvtl(cc_cmd, timeout=600)
+        _debug_write(f"  ffmpeg CC rc={rc_cc}")
+        if out_cc.strip():
+            for l in out_cc.splitlines():
+                _debug_write(f"    ffmpeg: {l}")
+
+        if rc_cc != 0:
+            _debug_write(f"  FAIL: CC removal failed")
+            os.remove(output_path)
+            return False, "Failed to remove closed captions."
+        if not os.path.exists(cc_path):
+            _debug_write(f"  FAIL: ffmpeg produced no output")
+            os.remove(output_path)
+            return False, "CC removal produced no output file."
+
+        # Replace original output with CC-stripped version
+        os.remove(output_path)
+        os.rename(cc_path, output_path)
+        _debug_write("  CC removal OK — replaced output with CC-stripped version")
 
     # ── Step 2 — mkvpropedit: set display width/height on the NEW file ─
     mkvpropedit = _get_mkvpropedit()
@@ -398,6 +437,8 @@ def process_mkv(mkv_path, output_dir, dar_str="16:9", remove_subs=True, audio_se
         msg += "  Subtitles Removed: Yes"
     else:
         msg += "  Subtitles Removed: No"
+    if remove_cc:
+        msg += "  Closed Captions Removed: Yes"
     if audio_sel is not None:
         msg += f"  Audio Kept: Track #{audio_sel}"
     _debug_write(f"  DONE — {msg}")
@@ -691,12 +732,27 @@ class App:
         )
         subs_cb.pack(side="left")
 
+        self.remove_cc_var = tk.BooleanVar(value=False)
+        cc_cb = tk.Checkbutton(
+            dar_row, text="Remove\nClosed\nCaptions", variable=self.remove_cc_var,
+            font=("Segoe UI", 9), bg=BG, fg=FG,
+            activebackground=BG, selectcolor=CARD, anchor="w", cursor="hand2"
+        )
+        cc_cb.pack(side="left")
+
         def _on_subs_change(*_args):
             """Save per-file settings on subs change — skip if restoring controls."""
             if getattr(self, '_restoring_file', False):
                 return
             self._save_current_file_settings()
         self.remove_subs_var.trace_add('write', _on_subs_change)
+
+        def _on_cc_change(*_args):
+            """Save per-file settings on CC change — skip if restoring controls."""
+            if getattr(self, '_restoring_file', False):
+                return
+            self._save_current_file_settings()
+        self.remove_cc_var.trace_add('write', _on_cc_change)
 
         self.delete_originals_var = tk.BooleanVar(value=False)
         del_cb = tk.Checkbutton(
@@ -923,6 +979,7 @@ class App:
                 'dar': self.dar_str.get(),
                 'audio_sel': audio_sel,
                 'remove_subs': self.remove_subs_var.get(),
+                'remove_cc': self.remove_cc_var.get(),
                 'delete_originals': self.delete_originals_var.get(),
             }
         else:
@@ -931,6 +988,7 @@ class App:
 
     def _process(self):
         remove_subs_global = self.remove_subs_var.get()
+        remove_cc_global = self.remove_cc_var.get()
         delete_originals_global = self.delete_originals_var.get()
         dar_str_global = self.dar_str.get()
         display = self.audio_var.get()
@@ -963,11 +1021,13 @@ class App:
             if fs:
                 dar_str = fs['dar']
                 remove_subs = fs['remove_subs']
+                remove_cc = fs.get('remove_cc', False)
                 audio_sel = fs['audio_sel']
                 delete_originals = fs['delete_originals']
             else:
                 dar_str = dar_str_global
                 remove_subs = remove_subs_global
+                remove_cc = remove_cc_global
                 audio_sel = audio_sel_global
                 delete_originals = delete_originals_global
 
@@ -975,7 +1035,7 @@ class App:
                      self._append_text(f"[{ix}/{t}] {n} …\n", color="#c0caf5"))
             self._tk(lambda prog=i * 100 // total: self._set_prog(prog))
 
-            s, msg = process_mkv(fp, self.output_dir, dar_str, remove_subs, audio_sel, delete_originals)
+            s, msg = process_mkv(fp, self.output_dir, dar_str, remove_subs, remove_cc, audio_sel, delete_originals)
             if s:
                 ok += 1
                 self._tk(lambda m=msg: self._append_text(f"  ✓ {m}\n", color="#9ece6a"))
@@ -1065,6 +1125,7 @@ class App:
                 'dar': self.dar_str.get(),
                 'audio_sel': audio_sel,
                 'remove_subs': self.remove_subs_var.get(),
+                'remove_cc': self.remove_cc_var.get(),
             }
 
         # Block trace saves during mode-dependent control updates
@@ -1155,6 +1216,7 @@ class App:
 
                 self.dar_str.set(fs['dar'])
                 self.remove_subs_var.set(fs['remove_subs'])
+                self.remove_cc_var.set(fs.get('remove_cc', False))
                 self.delete_originals_var.set(fs.get('delete_originals', False))
                 data = getattr(self, '_audio_track_data', {"Keep All": None})
                 for display, tid in data.items():
@@ -1172,6 +1234,7 @@ class App:
                 self.dar_str.set(self._dar_last_valid)
                 self.audio_var.set("Keep All")
                 self.remove_subs_var.set(False)
+                self.remove_cc_var.set(False)
                 self.delete_originals_var.set(False)
 
                 self._restoring_file = False
@@ -1209,6 +1272,7 @@ class App:
             if fs:
                 has_diff = (fs.get('dar') != self.dar_str.get() or
                            fs.get('remove_subs') != self.remove_subs_var.get() or
+                           fs.get('remove_cc') != self.remove_cc_var.get() or
                            fs.get('audio_sel') != self.audio_var.get())
             else:
                 has_diff = False

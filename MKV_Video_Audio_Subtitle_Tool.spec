@@ -14,6 +14,7 @@ a = Analysis(
         ('mkvinfo.exe', '.'),
         ('mkvmerge.exe', '.'),
         ('mkvpropedit.exe', '.'),
+        ('ffmpeg.exe', '.'),
     ],
     datas=[],
     hiddenimports=['win32gui', 'win32con'],
