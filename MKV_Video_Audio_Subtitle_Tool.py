@@ -26,19 +26,19 @@ import os
 import re
 import math
 import json
-import threading
+import msvcrt
+import _winapi
+
+# ─── UI colour constants ───
+GREEN = "#9ece6a"
+RED   = "#f7768e"
+
 
 # ─── Windows DND support (pywin32 + ctypes for DragQueryFile) ──────────────
 import ctypes
 from ctypes import wintypes
 
 WM_DROPFILES = 0x0233
-
-_CallWindowProcW = ctypes.WINFUNCTYPE(
-    ctypes.c_ssize_t,
-    ctypes.c_void_p, wintypes.UINT,
-    ctypes.c_ulonglong, ctypes.c_longlong
-)(ctypes.windll.user32.CallWindowProcW)
 
 _shell32 = ctypes.windll.shell32
 _DragQueryFileW = _shell32.DragQueryFileW
@@ -185,6 +185,77 @@ def run_mkvtl(args, timeout=300):
         return -1, "Timeout"
 
 
+# ─── mkvmerge --gui-mode progress parser ──────────────────────
+
+_gui_progress_re = re.compile(r'^#GUI#progress\s+(\d+)%')
+
+
+def _run_with_progress(args, timeout=600, callback=None):
+    """Run a subprocess and collect '#GUI#progress N%' lines from stdout.
+
+    Returns (returncode, combined_text, progress_events) where progress_events
+    is a list of ints.  If --gui-mode was not used the list will be empty.
+
+    *callback* may be called on any thread during polling — callers should
+    marshal Tk updates to the main thread if needed (the caller in this file
+    does so via _process()'s state-machine scheduling).
+    """
+    import time as _time
+
+    proc = subprocess.Popen(
+        args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0,
+    )
+
+    events: list[int] = []
+    out_lines: list[str] = []
+    buf = b""
+    deadline = _time.time() + timeout
+
+    while proc.poll() is None and _time.time() < deadline:
+        try:
+            chunk = os.read(proc.stdout.fileno(), 4096)
+        except OSError:
+            break
+        if not chunk:
+            _time.sleep(0.05)
+            continue
+        buf += chunk
+        while b"\n" in buf:
+            line_bytes, buf = buf.split(b"\n", 1)
+            try:
+                line = line_bytes.decode("utf-8", errors="replace")
+            except Exception:
+                continue
+            out_lines.append(line + "\n")
+            m = _gui_progress_re.match(line)
+            if m:
+                pct_val = int(m.group(1))
+                events.append(pct_val)
+                if callback:
+                    try:
+                        callback('mkvmerge', pct_val)
+                    except Exception:
+                        pass
+
+    # Final drain — collect any remaining data after EOF
+    try:
+        remainder = proc.stdout.read()
+        if remainder:
+            buf += remainder
+            while b"\n" in buf:
+                line_bytes, buf = buf.split(b"\n", 1)
+                try:
+                    line = line_bytes.decode("utf-8", errors="replace")
+                except Exception:
+                    continue
+                out_lines.append(line + "\n")
+    except OSError:
+        pass
+
+    return proc.returncode, ''.join(out_lines), events
+
+
 def probe_mkv(mkv_path):
     """Probe an MKV file with mkvinfo.
 
@@ -259,12 +330,12 @@ def probe_mkv(mkv_path):
 
 
 
-def process_mkv(mkv_path, output_dir, dar_str="16:9", remove_subs=True, remove_cc=False, audio_sel=None, delete_original=False):
+def process_mkv(mkv_path, output_dir, dar_str="16:9", remove_subs=True,
+                remove_cc=False, audio_sel=None, delete_original=False, callback=None):
     """Process one MKV — set DAR via mkvmerge + mkvpropedit.  Returns (ok, msg).
 
-    *audio_sel*: None = keep all audio tracks; int = only keep this track ID.
-    *delete_original*: True = remove the source file after successful processing.
-    *remove_cc*: True = strip closed captions via ffmpeg bitstream filter.
+    *callback*: optional callable(step, pct, text) for real-time progress updates.
+                 step is 'mkvmerge', 'ffmpeg', 'mkvpropedit', or 'done'.
     """
     # Parse DAR
     try:
@@ -282,8 +353,8 @@ def process_mkv(mkv_path, output_dir, dar_str="16:9", remove_subs=True, remove_c
         msg = "mkvmerge.exe not found."
         return False, msg
 
-    # Build mkvmerge args: copy tracks, optionally delete subtitles, filter audio
-    merge_args = ['-o', output_path]
+    # Build mkvmerge args: copy tracks, optionally delete subtitles, filter audio + gui-mode
+    merge_args = ['-o', output_path, '--gui-mode']
 
     if audio_sel is not None:
         merge_args += ['--audio-tracks', str(audio_sel)]
@@ -295,7 +366,16 @@ def process_mkv(mkv_path, output_dir, dar_str="16:9", remove_subs=True, remove_c
     merge_args.append(mkv_path)
     full_command = [mkvmerge] + merge_args
 
-    rc, out_text = run_mkvtl(full_command, timeout=600)
+    rc, out_text, progress_events = _run_with_progress(full_command, timeout=600, callback=callback)
+
+    # Estimate time for remaining steps if we got real progress from mkvmerge.
+    # When muxing finishes (100% or close), report estimated time for CC removal
+    # and metadata editing so the bar keeps moving.
+    if callback and (not progress_events or 100 not in progress_events):
+        size_mb = max(1, os.path.getsize(mkv_path) / (1024 * 1024))
+        mux_est = size_mb / 50.0  # ~50 MB/s mux speed estimate
+        rem_secs = mux_est + (mux_est * 0.3 if remove_cc else 0) + 2.0  # propedit ~2s
+        callback('mkvmerge', 99, f"Muxing video… {rem_secs:.0f}s remaining")
 
     # Verify output file was actually created
     if not os.path.exists(output_path):
@@ -310,9 +390,29 @@ def process_mkv(mkv_path, output_dir, dar_str="16:9", remove_subs=True, remove_c
             os.remove(output_path)
             return False, "ffmpeg.exe not found."
 
-        cc_cmd = [ffmpeg, '-i', output_path, '-codec', 'copy',
-                   '-bsf:v', 'filter_units=remove_types=6', cc_path]
-        rc_cc, out_cc = run_mkvtl(cc_cmd, timeout=600)
+        # Estimate time for ffmpeg CC removal (copy mode — fast)
+        size_mb = max(1, os.path.getsize(output_path) / (1024 * 1024))
+        cc_est = size_mb / 100.0
+
+        def _run_cc():
+            proc = subprocess.Popen(
+                [ffmpeg, '-i', output_path, '-codec', 'copy',
+                 '-bsf:v', 'filter_units=remove_types=6', cc_path],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, timeout=600,
+                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0)
+            import time as _t
+            start = _t.time()
+            while proc.poll() is None:
+                elapsed = _t.time() - start
+                pct = min(98, int((elapsed / cc_est) * 100)) if cc_est > 0 else 0
+                remaining = max(0, cc_est - elapsed)
+                if callback:
+                    callback('ffmpeg', pct, f"Removing CC… {remaining:.0f}s remaining")
+                _t.sleep(0.1)
+            return proc.returncode
+
+        rc_cc = _run_cc()
 
         if rc_cc != 0:
             os.remove(output_path)
@@ -334,6 +434,11 @@ def process_mkv(mkv_path, output_dir, dar_str="16:9", remove_subs=True, remove_c
     # Build mkvpropedit arguments for DAR editing
     dar_args = ['--edit', 'track:v1', '--set', f'display-width={dar_w}',
                 '--set', f'display-height={dar_h}', '--set', 'display-unit=3']
+
+    prop_est = 2.0  # mkvpropedit is typically fast (~2s)
+    if callback:
+        callback('mkvpropedit', 99, f"Setting metadata… {prop_est:.0f}s remaining")
+        callback('done', 100)
 
     rc, out_text = run_mkvtl([mkvpropedit, output_path] + dar_args, timeout=60)
 
@@ -498,12 +603,9 @@ class App:
     def __init__(self, root):
         self.root = root
         self.root.title("MKV Video Audio & Subtitle Tool")
-        self.root.geometry("850x500")
+        self.root.geometry("850x530")
         self.root.resizable(False, False)
         self.root.configure(bg="#1a1b26")
-        # Always stay on top so processing windows and progress bar are never obscured
-        self.root.attributes('-topmost', True)
-
         self.file_list = []
         self.selected_file_index = -1  # -1 = no file selected → global settings apply
         self.processing = False
@@ -517,8 +619,6 @@ class App:
         CARD     = "#24283b"
         FG       = "#c0caf5"
         ACCENT   = "#7aa2f7"
-        GREEN    = "#9ece6a"
-        RED      = "#f7768e"
         MUTED    = "#565f89"
 
         # ── Drop zone ────────────────────────────────────────────────
@@ -570,7 +670,8 @@ class App:
         self.info_var = tk.StringVar(value=None)
         self.info_lbl = tk.Label(root, textvariable=self.info_var,
                                  font=("Segoe UI", 9), bg=BG, fg=MUTED, anchor="w")
-        self.info_lbl.pack(fill="x", padx=16, pady=(0, 1))
+        self.info_lbl.pack(fill="x", padx=16, pady=(0, 4))
+
 
         # ── Mode toggle (Batch / Individual) ─────────────────────────
         mode_row = tk.Frame(root, bg=BG)
@@ -598,6 +699,9 @@ class App:
             font=("Consolas", 9),
             padding=3
         )
+
+        # Progress bars use canvas - no ttk style needed
+
         # DAR uses a tk.StringVar with textvariable on the Entry.
         # trace_add fires on BOTH user typing AND programmatic .set() calls.
         # To capture per-file settings we need saving in the trace, but we must
@@ -724,27 +828,39 @@ class App:
         self.delete_originals_var.trace_add('write', _on_delete_change)
 
         # ── Progress ─────────────────────────────────────────────────
-        self.pbar_style = ttk.Style()
-        self.pbar_style.configure("custom.Horizontal.TProgressbar",
-                                  background=ACCENT, troughcolor="#16171a", thickness=8)
 
-        pbar_outer = tk.Frame(root, bg=BG)
-        pbar_outer.pack(fill="x", padx=14, pady=(0, 6))
+        # Card container holding both bars
+        CARD_BG = "#1b1e28"  # Dark card background for progress area
+        pbar_card = tk.Frame(root, bg=CARD_BG)
+        pbar_card.pack(fill="x", padx=14, pady=6)
 
-        # Percentage label — always visible above the tray
-        self.pbar_label = tk.Label(
-            pbar_outer, text="0%", font=("Segoe UI", 9, "bold"),
-            bg=BG, fg=ACCENT,
-        )
-        self.pbar_label.pack(fill="x")
+        # --- Current file progress (label + percentage → track) ---
+        self.cur_row = tk.Frame(pbar_card, bg=CARD_BG)
+        self.cur_row.pack(fill="x", padx=8)
 
-        # Tray frame — bg is the tray color so everything inside has a seamless background
-        pbar_tray = tk.Frame(pbar_outer, bg="#16171a")
-        pbar_tray.pack(fill="x")
+        self.cur_text = tk.Label(
+            self.cur_row, text="Current File: 0%", font=("Segoe UI", 9),
+            bg=CARD_BG, fg="#7aa2f7")
+        self.cur_text.pack(anchor="w")
 
-        self.pbar = ttk.Progressbar(pbar_tray, style="custom.Horizontal.TProgressbar",
-                                    mode="determinate", length=520)
-        self.pbar.pack(fill="x", padx=8, pady=2)
+        self.cur_canvas = tk.Canvas(
+            self.cur_row, width=520, height=14, bg="#161923",
+            highlightthickness=1, highlightbackground="#ffffff")
+        self.cur_canvas.pack(fill="x", pady=(2, 0))
+
+        # --- Overall progress (label + percentage → track) ---
+        self.over_row = tk.Frame(pbar_card, bg=CARD_BG)
+        self.over_row.pack(fill="x", padx=8, pady=(6, 0))
+
+        self.over_text = tk.Label(
+            self.over_row, text="Overall: 0%", font=("Segoe UI", 9),
+            bg=CARD_BG, fg="#7aa2f7")
+        self.over_text.pack(anchor="w")
+
+        self.over_canvas = tk.Canvas(
+            self.over_row, width=520, height=14, bg="#161923",
+            highlightthickness=1, highlightbackground="#ffffff")
+        self.over_canvas.pack(fill="x")
 
         # ── Buttons ──────────────────────────────────────────────────
         btn_row = tk.Frame(root, bg=BG)
@@ -822,7 +938,9 @@ class App:
                     except Exception as e:
                         self._dnd_log(f"error querying drop: {e}")
                     return 0
-                return _CallWindowProcW(self._dnd_original_proc, h, msg, wp, lp)
+                proc = int(self._dnd_original_proc)
+                return ctypes.windll.user32.CallWindowProcW(
+                    proc, h, msg, wp, lp)
 
             win32gui.SetWindowLong(hwnd, GWLP_WNDPROC, wnd_callback)
 
@@ -878,17 +996,18 @@ class App:
         self.txt.config(state="normal")
         self.txt.delete("1.0", "end")
         self.txt.config(state="disabled")
-        self.pbar['value'] = 0
-        self._update_info()
+        self.cur_canvas.create_rectangle(
+            1, 2, 519, 13, fill="#1e2130", outline="")
+        self.over_canvas.create_rectangle(
+            1, 2, 519, 13, fill="#1e2130", outline="")
+        self.cur_text.config(text="Current File: 0%")
+        self.over_text.config(text="Overall: 0%")
         if not self.processing:
             self.proc_btn.config(state="disabled")
 
     def _update_info(self):
-        """Update the info bar — shows file count and output directory."""
-        if self.output_dir:
-            self.info_var.set(f"Files: {len(self.file_list)}   |   Output: {self.output_dir}")
-        else:
-            self.info_var.set('Output folder not set')
+        """Update the info bar — shows file count."""
+        self.info_var.set(f"Files: {len(self.file_list)}")
 
     def _pick_output(self):
         d = filedialog.askdirectory(title="Choose Output Directory")
@@ -899,7 +1018,6 @@ class App:
             if not self.processing and self.file_list:
                 self.proc_btn.config(state="normal", bg="#9ece6a")
 
-    # -- processing (stub — no backend yet) --
     def _start_process(self):
         if not self.file_list or self.processing:
             return
@@ -912,7 +1030,7 @@ class App:
         except ValueError as e:
             messagebox.showerror("Invalid DAR", str(e))
             return
-        threading.Thread(target=self._process, daemon=True).start()
+        self._process()
 
     def _save_current_file_settings(self):
         """Save current control values to per-file settings for the selected file.
@@ -939,6 +1057,19 @@ class App:
             pass
 
     def _process(self):
+        """Batch-process files — now runs entirely on the main thread via after() scheduling.
+
+        Replaced the old threading.Thread(daemon=True) pattern because canvas pixels
+        never flush to screen when Tk widget updates happen on a background thread.
+        WM_PAINT messages only process through Win32's message pump, which is tied to
+        the main thread's mainloop().  Canvas drawing from any other thread produces
+        invisible changes — root.update() does not help across thread boundaries.
+
+        This method sets up state, then kicks off the first after()-scheduled step:
+        _process_step(), which drives the entire pipeline as a state machine.
+        """
+        import time as _time
+
         remove_subs_global = self.remove_subs_var.get()
         remove_cc_global = self.remove_cc_var.get()
         delete_originals_global = self.delete_originals_var.get()
@@ -958,19 +1089,86 @@ class App:
         self._tk(lambda: self.info_var.set("Processing…"))
         self._tk(lambda: self._append_text("\n── processing ──\n", color="#565f89"))
 
+        # Reset progress bars for new batch
+        cw = 518
+        ow = 518
+        self.cur_canvas.create_rectangle(1, 2, 1 + cw, 13, fill="#1e2130", outline="")
+        self.over_canvas.create_rectangle(1, 2, 519, 13, fill="#1e2130", outline="")
+        self.cur_text.config(text="Current File: 0%")
+        self.over_text.config(text="Overall: 0%")
+
         total = len(self.file_list)
-        ok = fail = 0
-        processing_msg = None  # always bound so no UnboundLocalError in nested lambdas
+        ok = 0
+        fail = 0
+
+        # ── Initialise state-machine internals ────────────────────────────
+        self._proc_state = {
+            'idx': 0,           # next file index (0-based)
+            'total': total,
+            'ok': ok,
+            'fail': fail,
+            # Per-file fields filled when we reach BUILD_FILE:
+            'fp': None,         # file path being processed
+            'fname': None,
+            'dar_str': None,
+            'remove_subs': False,
+            'remove_cc': False,
+            'audio_sel': None,
+            'delete_originals': False,
+            'output_path': None,
+            'merge_args': None,
+            # Mux step:
+            'mux_proc': None,
+            'mux_buf': b'',
+            'mux_events': [],
+            # Step state machine states:
+            'step': None,      # None → BUILD_FILE → MKV_START → MKV_POLL → FFmpeg_CC
+                              #                → PROPEDIT → DONE_FILE → NEXT or COMPLETE
+        }
+
+        # Kick off the state machine on the main thread via after()
+        self.root.after(0, self._process_step)
+
+    def _process_step(self):
+        """Tk-driven state machine step — called via root.after() so all Tk updates
+        happen on the main thread and canvas pixels flush to screen in real time.
+        """
+        import time as _time
+        s = self._proc_state
+        if not s:
+            return
+
+        step = s.get('step') or 'BUILD_FILE'
+        self._proc_step = step  # track for error reporting
 
         try:
-            for i, fp in enumerate(self.file_list, 1):
-                if not os.path.isfile(fp):
-                    fn = os.path.basename(fp)
-                    self.root.after(0, lambda fn=fn: self._append_text(f"⊘ SKIP {fn} (not found)\n", color="#f7768e"))
-                    fail += 1
-                    continue
+            # ─── BUILD_FILE: pick next file, gather settings, build args ───
+            if step == 'BUILD_FILE':
+                idx = s['idx']
+                total = s['total']
+                if idx >= total:
+                    self._process_complete()
+                    return
 
-                # Look up per-file settings; fall back to global defaults
+                fp = self.file_list[idx]
+
+                if not os.path.isfile(fp):
+                    fname = os.path.basename(fp)
+                    s['fail'] += 1
+                    pct_done = int(idx * 100 / total)
+                    ow = max(2, (self.over_canvas.winfo_width() - 2) if self.over_canvas.winfo_width() > 0 else 518)
+                    fw = max(2, int(ow * pct_done / 100.0))
+                    self.root.after(0, lambda fw=fw, ow=ow, pd=pct_done: (
+                        self.over_canvas.delete("fill"),
+                        self.over_canvas.create_rectangle(1, 2, 1 + fw, 13, fill="#7ab5cf", tag="fill"),
+                        self.over_text.config(text=f"Overall: {pd}%", fg=RED)
+                    ))
+                    self.root.after(0, lambda fn=fname: self._append_text(f"⊘ SKIP {fn} (not found)\n", color="#f7768e"))
+                    s['idx'] = idx + 1
+                    s['step'] = 'BUILD_FILE'
+                    self.root.after(0, self._process_step)
+                    return
+
                 fs = self.file_settings.get(fp)
                 if fs:
                     dar_str = fs['dar']
@@ -979,48 +1177,378 @@ class App:
                     audio_sel = fs['audio_sel']
                     delete_originals = fs.get('delete_originals', False)
                 else:
-                    dar_str = dar_str_global
-                    remove_subs = remove_subs_global
-                    remove_cc = remove_cc_global
-                    audio_sel = audio_sel_global
-                    delete_originals = delete_originals_global
+                    dar_str = self.dar_str.get()
+                    remove_subs = self.remove_subs_var.get()
+                    remove_cc = self.remove_cc_var.get()
+                    audio_sel = self._global_audio_sel
+                    delete_originals = self.delete_originals_var.get()
 
                 fname = os.path.basename(fp)
-                self.root.after(0, lambda n=fname, ix=i, t=total: self._append_text(f"[{ix}/{t}] {n} …\n", color="#c0caf5"))
-                self.root.after(0, lambda prog=i * 100 // total: self._set_prog(prog))
+                output_path = os.path.join(self.output_dir,
+                                           os.path.splitext(fname)[0] + '.mkv')
+                merge_args = ['-o', output_path, '--gui-mode']
+                if audio_sel is not None:
+                    merge_args += ['--audio-tracks', str(audio_sel)]
+                if remove_subs:
+                    merge_args.append('-S')
+                merge_args.append(fp)
 
-                result = process_mkv(fp, self.output_dir, dar_str, remove_subs, remove_cc, audio_sel, delete_originals)
-                # Force-bind result values as early as possible so no variable is potentially unbound.
-                # We re-assign processing_msg below only to update the lambda's captured value.
-                if result[0]:
-                    ok += 1
-                    self._tk(lambda: self._append_text(f"  ✓ {result[1]}\n", color="#9ece6a"))
+                # Store per-file state
+                s.update({
+                    'fp': fp, 'fname': fname, 'dar_str': dar_str,
+                    'remove_subs': remove_subs, 'remove_cc': remove_cc,
+                    'audio_sel': audio_sel, 'delete_originals': delete_originals,
+                    'output_path': output_path, 'merge_args': merge_args,
+                })
+
+                # UI updates on main thread
+                self.root.after(0, lambda n=fname, ix=idx + 1, t=total:
+                               self._append_text(f"[{ix}/{t}] {n} …\n", color="#c0caf5"))
+
+                # Overall progress before processing this file
+                pct_before = int(idx * 100 / total)
+                ow = max(2, (self.over_canvas.winfo_width() - 2) if self.over_canvas.winfo_width() > 0 else 518)
+                fw_ov = max(2, int(ow * pct_before / 100.0))
+                self.root.after(0, lambda fw=fw_ov: (
+                    self.over_canvas.delete("fill"),
+                    self.over_canvas.create_rectangle(1, 2, 1 + fw, 13, fill="#7ab5cf", tag="fill")
+                ))
+                self.root.after(0, lambda pd=pct_before: self.over_text.config(text=f"Overall: {pd}%"))
+
+                # ─── Start mkvmerge subprocess ───
+                mkvmerge = _get_mkvmerge()
+                s['mux_proc'] = None
+                s['mux_buf'] = b''
+                s['mux_events'] = []
+                s['mux_error'] = None
+
+                try:
+                    s['mux_proc'] = subprocess.Popen(
+                        [mkvmerge] + merge_args,
+                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                        creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0,
+                    )
+                except Exception as exc:
+                    s['mux_error'] = str(exc)
+                    s['step'] = 'MKV_POLL'
+                    self.root.after(0, self._process_step)
+                    return
+
+                # Set up callback context for real-time progress updates.
+                # The callback stores percentage in cb_ctx — the main-thread timer
+                # reads from cb_ctx and updates Tk widgets (safe: all on main thread).
+                cb_ctx = {'pct': 0}
+                s['cb_ctx'] = cb_ctx
+
+                def _mux_cb(step, pct=None, text=None):
+                    """Progress callback — stores percentage for the poll timer to read."""
+                    p = min(100, max(pct if pct is not None else 0, 0))
+                    cb_ctx['pct'] = int(p)
+
+                s['_mux_cb'] = _mux_cb
+
+                # Start a polling timer that calls the callback and monitors process state.
+                # The timer runs on the main thread via after(), so all Tk updates
+                # inside the callback happen on the right thread.
+                def _start_poll():
+                    if s.get('mux_proc') is None or s.get('step') != 'MKV_POLL':
+                        return
+                    cb = s.get('_mux_cb')
+                    proc = s.get('mux_proc')
+                    if proc is None:
+                        s['step'] = 'MKV_POLL'
+                        self.root.after(0, self._process_step)
+                        return
+
+                    # Read available data from pipe (non-blocking via PeekNamedPipe)
+                    avail = 0
+                    try:
+                        handle = msvcrt.get_osfhandle(proc.stdout.fileno())
+                        avail_bytes, _ = _winapi.PeekNamedPipe(handle, 0)
+                        avail = avail_bytes if isinstance(avail_bytes, int) else 0
+                    except Exception:
+                        pass
+
+                    if avail > 0:
+                        try:
+                            chunk = proc.stdout.read(min(avail, 65536))
+                            if chunk:
+                                s['mux_buf'] += chunk
+                                while b"\n" in s['mux_buf']:
+                                    line_bytes, s['mux_buf'] = s['mux_buf'].split(b"\n", 1)
+                                    try:
+                                        line = line_bytes.decode("utf-8", errors="replace")
+                                    except Exception:
+                                        continue
+                                    m = _gui_progress_re.match(line)
+                                    if m:
+                                        pct_val = int(m.group(1))
+                                        s['mux_events'].append(pct_val)
+                                        if cb:
+                                            self.root.after(0, lambda p=pct_val: cb('mkvmerge', p))
+                        except OSError:
+                            pass
+
+                    if proc.poll() is not None:
+                        # Process finished — drain remaining data
+                        try:
+                            remainder = proc.stdout.read()
+                            if remainder and s.get('mux_buf'):
+                                s['mux_buf'] += remainder
+                        except OSError:
+                            pass
+                        s['step'] = 'MKV_DONE'
+                        return
+
+                    # Schedule next poll (16ms ≈ 60Hz, matches typical display refresh)
+                    s['step'] = 'MKV_POLL'
+                    self.root.after(16, _start_poll)
+
+                s['step'] = 'MKV_POLL'
+                self.root.after(0, _start_poll)
+
+                # Schedule the next step to handle process completion.
+                # This fires immediately but will wait until after any pending
+                # Tk events (including the _start_poll timer).  When the poller
+                # detects proc.poll() is not None, it sets step = 'MKV_DONE'
+                # and this callback becomes a no-op.
+                self.root.after(100, self._process_step)
+
+            # ─── MKV_POLL / MKV_DONE: check if muxing completed ───
+            elif step in ('MKV_POLL', 'MKV_DONE'):
+                proc = s.get('mux_proc')
+                if proc is None or proc.poll() is None:
+                    # Still running — poller will handle updates.  Check back.
+                    self.root.after(100, self._process_step)
+                    return
+
+                rc = proc.returncode
+                cb_ctx = s.get('cb_ctx', {})
+                events = s.get('mux_events', [])
+                last_pct = cb_ctx.get('pct', 0)
+
+                # Final canvas update with captured percentage
+                self.root.after(0, lambda lp=last_pct: (
+                    self.cur_canvas.create_rectangle(1, 2, 1 + max(2, int((self.cur_canvas.winfo_width() - 2) * lp / 100.0)), 13, fill="#7ab5cf", outline="")
+                ) if lp > 0 else None)
+                self.root.after(0, lambda lp=last_pct:
+                               self.cur_text.config(text=f"Current File: {lp}%") if lp > 0 else None)
+
+                # Build final callback message for remaining steps
+                def _build_cb_for_remaining():
+                    cb_ctx_local = {'pct': last_pct}
+                    def _cb(st, pct=None, text=None):
+                        p = min(100, max(pct if pct is not None else 0, 0))
+                        cb_ctx_local['pct'] = int(p)
+                    return _cb, cb_ctx_local
+
+                mux_cb, mux_cb_ctx = _build_cb_for_remaining()
+
+                # Check if output file exists
+                output_path = s.get('output_path', '')
+                if not os.path.exists(output_path):
+                    self._process_file_result(False, "mkvmerge produced no output file", cb_ctx=mux_cb_ctx)
+                    return
+
+                # ─── FFmpeg CC removal step ───
+                if s.get('remove_cc'):
+                    ffmpeg = _get_ffmpeg()
+                    if ffmpeg is None:
+                        try:
+                            os.remove(output_path)
+                        except OSError:
+                            pass
+                        self._process_file_result(False, "ffmpeg.exe not found.", cb_ctx=mux_cb_ctx)
+                        return
+
+                    cc_path = output_path.rsplit('.', 1)[0] + '_cc.mkv'
+                    size_mb = max(1, os.path.getsize(output_path) / (1024 * 1024))
+                    cc_est = size_mb / 100.0
+
+                    try:
+                        mux_cc_proc = subprocess.Popen(
+                            [ffmpeg, '-i', output_path, '-codec', 'copy',
+                             '-bsf:v', 'filter_units=remove_types=6', cc_path],
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0)
+                    except Exception as exc:
+                        self._process_file_result(False, f"ffmpeg failed: {exc}", cb_ctx=mux_cb_ctx)
+                        return
+
+                    # Poll CC removal with time-based estimate
+                    cc_start = _time.time()
+                    while mux_cc_proc.poll() is None:
+                        elapsed = _time.time() - cc_start
+                        pct_cc = min(98, int((elapsed / cc_est) * 100)) if cc_est > 0 else 0
+                        rem = max(0, cc_est - elapsed)
+                        mux_cb('ffmpeg', pct_cc, f"Removing CC… {rem:.0f}s remaining")
+                        time.sleep(0.1)
+
+                    if mux_cc_proc.returncode != 0:
+                        try:
+                            os.remove(output_path)
+                        except OSError:
+                            pass
+                        self._process_file_result(False, "Failed to remove closed captions.", cb_ctx=mux_cb_ctx)
+                        return
+
+                    if not os.path.exists(cc_path):
+                        try:
+                            os.remove(output_path)
+                        except OSError:
+                            pass
+                        self._process_file_result(False, "CC removal produced no output file.", cb_ctx=mux_cb_ctx)
+                        return
+
+                    # Success — swap CC file over original
+                    try:
+                        os.remove(output_path)
+                        os.rename(cc_path, output_path)
+                    except OSError as exc:
+                        self._process_file_result(False, f"CC rename failed: {exc}", cb_ctx=mux_cb_ctx)
+                        return
+
+                # ─── mkvpropedit step ───
+                dar_w, dar_h = parse_dar(s['dar_str'])
+                mux_cb('mkvpropedit', 99, "Setting metadata…")
+                mux_cb('done', 100)
+
+                mkvpropedit = _get_mkvpropedit()
+                if mkvpropedit is None:
+                    try:
+                        os.remove(output_path)
+                    except OSError:
+                        pass
+                    self._process_file_result(False, "mkvpropEdit.exe not found.", cb_ctx=mux_cb_ctx)
+                    return
+
+                rc_pe, out_text_pe = run_mkvtl(
+                    [mkvpropedit, output_path] +
+                    ['--edit', 'track:v1', '--set', f'display-width={dar_w}',
+                     '--set', f'display-height={dar_h}', '--set', 'display-unit=3'],
+                    timeout=60)
+
+                if rc_pe != 0:
+                    try:
+                        os.remove(output_path)
+                    except OSError:
+                        pass
+                    self._process_file_result(False,
+                                              f"mkvpropedit failed (rc={rc_pe}): {out_text_pe}",
+                                              cb_ctx=mux_cb_ctx)
+                    return
+
+                # Build success message
+                msg_parts = [f"Display Aspect Ratio Set to {dar_w}:{dar_h}"]
+                if s['remove_subs']:
+                    msg_parts.append("Subtitles Removed: Yes")
                 else:
-                    fail += 1
-                    self._tk(lambda: self._append_text(f"  ✗ {result[1]}\n", color="#f7768e"))
+                    msg_parts.append("Subtitles Removed: No")
+                if s['remove_cc']:
+                    msg_parts.append("Closed Captions Removed: Yes")
+                if s['audio_sel'] is not None:
+                    msg_parts.append(f"Audio Kept: Track #{s['audio_sel']}")
+
+                self._process_file_result(True, " ".join(msg_parts), cb_ctx=mux_cb_ctx)
+
+            # ─── DONE_FILE: already handled by _process_file_result ───
+            # (transition happens inside _process_file_result)
 
         except Exception as e:
-            # Catch any unexpected error (process_mkv crash, OOM, etc.) to guarantee reset
-            fail += 1
-            processing_msg = f"  ✗ Unexpected error: {e}"
-            self.root.after(0, lambda m=processing_msg: self._append_text(m + "\n", color="#f7768e"))
+            s['fail'] += 1
+            self.root.after(0, lambda m=f"  ✗ Unexpected error: {e}": self._append_text(m + "\n", color="#f7768e"))
+            # Clean up any running subprocesses before completing
+            if s.get('mux_proc') is not None and s['mux_proc'].poll() is None:
+                try:
+                    s['mux_proc'].terminate()
+                except Exception:
+                    pass
+            self._process_complete()
 
-        finally:
-            # Guaranteed reset of UI state — always runs regardless of exceptions above
+    def _process_file_result(self, ok, msg, cb_ctx=None):
+        """Record the result for one file and transition to the next file or complete.
+
+        All Tk updates happen on the main thread via after() so canvas pixels flush
+        to screen immediately.
+        """
+        s = self._proc_state
+        if not s:
+            return
+
+        if ok:
+            s['ok'] += 1
+        else:
+            s['fail'] += 1
+
+        # Update current file label with captured percentage
+        pct = cb_ctx.get('pct', 0) if cb_ctx else 0
+        self.root.after(0, lambda p=pct: self.cur_text.config(text=f"Current File: {p}%") if p > 0 else None)
+
+        # Update overall progress bar (chunk-based: file completed)
+        total = s['total']
+        idx_done = s['idx'] + 1  # this file just completed
+        pct_done = int(idx_done * 100 / total)
+        ow = max(2, (self.over_canvas.winfo_width() - 2) if self.over_canvas.winfo_width() > 0 else 518)
+        fw_ov = max(2, int(ow * pct_done / 100.0))
+        color = GREEN if ok else RED
+        self.root.after(0, lambda f=fw_ov: (
+            self.over_canvas.delete("fill"),
+            self.over_canvas.create_rectangle(1, 2, 1 + f, 13, fill="#7ab5cf", tag="fill")
+        ))
+        self.root.after(0, lambda pd=pct_done, c=color: (
+            self.over_text.config(text=f"Overall: {pd}%", fg=c)
+        ))
+
+        # Append result to log
+        if ok:
+            self.root.after(0, lambda m=msg: self._append_text(f"  ✓ {m}\n", color="#9ece6a"))
+        else:
+            self.root.after(0, lambda m=msg: self._append_text(f"  ✗ {m}\n", color="#f7768e"))
+
+        # Move to next file or complete
+        s['idx'] += 1
+        if s['idx'] < s['total']:
+            # Schedule next file build on the main thread (after current events flush)
+            self.root.after(50, self._process_step)
+        else:
+            # All files done — schedule complete after pending Tk events flush
+            self.root.after(50, self._process_complete)
+
+    def _process_complete(self):
+        """Finalise batch processing — reset UI state and re-enable controls."""
+        s = self._proc_state or {}
+        ok = s.get('ok', 0)
+        fail = s.get('fail', 0)
+        total = s.get('total', 0)
+
+        # Clear any running subprocess
+        if getattr(self, '_mux_proc', None) is not None and self._mux_proc.poll() is None:
             try:
-                self.root.after(0, lambda prog=100: self._set_prog(prog))
-                self.root.after(0, lambda o=ok, f=fail: self.info_var.set(f"Done — ✓ {o}   ✗ {f}"))
-                self.root.after(0, lambda: self._append_text(
-                    f"\n═══ complete: {ok} ok, {fail} failed ═══\n", color="#7aa2f7"))
-
-                self.processing = False
-                if fail > 0:
-                    self.root.after(0, lambda: self.proc_btn.config(state="normal", bg="#e5a536"))
-                else:
-                    self.root.after(0, lambda: self.proc_btn.config(state="normal", bg="#9ece6a"))
+                self._mux_proc.terminate()
             except Exception:
-                # Safety net — unstick even if Tk is in bad state
-                self.processing = False
+                pass
+
+        # Final canvas updates (100% overall)
+        ow = max(2, (self.over_canvas.winfo_width() - 2) if self.over_canvas.winfo_width() > 0 else 518)
+        fw_ov = max(2, int(ow * 100 / 100.0))
+        self.cur_canvas.create_rectangle(1, 2, 1 + fw_ov, 13, fill="#7ab5cf", outline="")
+        self.over_canvas.create_rectangle(1, 2, 1 + fw_ov, 13, fill="#7ab5cf", outline="")
+
+        # Schedule remaining UI updates on main thread (after any pending events)
+        self.root.after(0, lambda: self._append_text(
+            f"\n═══ complete: {ok} ok, {fail} failed ═══\n", color="#7aa2f7"))
+        self.root.after(0, lambda o=ok, f=fail: self.info_var.set(f"Done — ✓ {o}   ✗ {f}"))
+        # Reset overall label text color back to default blue after processing completes
+        self.root.after(0, lambda: self.over_text.config(fg="#7aa2f7"))
+
+        # Clear state and re-enable controls
+        self._proc_state = {}
+        self._mux_proc = None
+        self.processing = False
+        if fail > 0:
+            self.root.after(0, lambda: self.proc_btn.config(state="normal", bg="#e5a536"))
+        else:
+            self.root.after(0, lambda: self.proc_btn.config(state="normal", bg="#9ece6a"))
 
     # -- Tk threading helpers --
     # -- audio track probing --
@@ -1138,10 +1666,6 @@ class App:
 
     def _tk(self, fn):
         self.root.after(0, fn)
-
-    def _set_prog(self, v):
-        self.pbar['value'] = v
-        self.pbar_label.config(text=f"{v}%")
 
     def _append_text(self, msg, color=None, tag_name=None):
         """Append text to the file list area.

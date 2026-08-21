@@ -45,7 +45,7 @@ Everything runs locally on your machine — **no re-encoding** means processing 
 - :black_heart: **Dark theme** — easy on the eyes for extended use.
 - :clipboard: **Drag-and-drop support** — drop MKV files or folders directly onto the blue drop zone at the top of the window.
 - :floppy_disk: **Persistent output folder** — remembers your last chosen output location across launches.
-- :bar_chart: **Live progress feedback** — a blue animated progress bar with a percentage overlay shows real-time processing status for each file.
+- :bar_chart: **Progress feedback** — a blue animated progress bar with a percentage overlay tracks processing status at the file and overall level.
 - :point_right: **Clickable file list** — each entry displays a color-coded status tag (green = custom per-file settings, blue = global default, yellow-green highlight = selected).
 
 ### :gear: Technical Details
