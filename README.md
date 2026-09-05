@@ -1,6 +1,6 @@
 # MKV Video Audio & Subtitle Tool
 
-A desktop application for batch-processing MKV video files — changing display aspect ratio, removing subtitles, and filtering audio tracks — all without re-encoding. Powered by mkvtoolnix for fast, lossless container operations.
+A desktop application for processing MKV video files — individually or in batch — changing display aspect ratio, removing subtitles and closed captions, and filtering audio tracks — all without re-encoding. Powered by mkvtoolnix for fast, lossless container operations.
 
 <div align="center">
 
@@ -52,8 +52,8 @@ Everything runs locally on your machine — **no re-encoding** means processing 
 
 | Detail | Description |
 |--------|-------------|
-| :wrench: **Backend** | Uses mkvtoolnix utilities (mkvmerge, mkvpropedit, mkvinfo) — bundled with the app so nothing extra to install. |
-| :construction: **Processing Pipeline** | Step 1: mkvmerge remuxes your content with the chosen filters (audio track deletion, subtitle removal). Step 2: mkvpropedit writes display aspect ratio metadata into the container. |
+| :wrench: **Backend** | Uses mkvtoolnix utilities (mkvmerge, mkvpropedit, mkvinfo) and FFmpeg for bitstream filtering — all bundled with the app so nothing extra to install. |
+| :construction: **Processing Pipeline** | Step 1: mkvmerge remuxes your content with the chosen filters (audio track deletion, subtitle removal). Step 1b: If CC removal is enabled, ffmpeg strips closed captions via bitstream filter. Step 2: mkvpropedit writes display aspect ratio metadata and enables the remaining audio track flag. |
 
 ---
 
@@ -146,7 +146,7 @@ MKV Video Audio & Subtitle Tool/
 
 ## :computer: Configuration
 
-Your output folder choice is saved automatically — no configuration needed. To reset it, just delete the `settings.json` file in the app's directory. Processing logs are written to the same directory while jobs run; they contain command-level detail useful for troubleshooting.
+Your output folder choice is saved automatically — no configuration needed. To reset it, just delete the `settings.json` file in the app's directory.
 
 ---
 
