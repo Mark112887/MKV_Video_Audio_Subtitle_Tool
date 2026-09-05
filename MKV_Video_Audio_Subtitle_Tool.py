@@ -347,6 +347,9 @@ def process_mkv(mkv_path, output_dir, dar_str="16:9", remove_subs=True,
     basename = os.path.splitext(os.path.basename(mkv_path))[0]
     output_path = os.path.join(output_dir, f"{basename}.mkv")
 
+    # Ensure absolute path for reliable file operations (delete, size checks, etc.)
+    mkv_path = os.path.abspath(mkv_path)
+
     # ── Step 1 — mkvmerge: copy tracks, optionally filter audio & remove subs ─
     mkvmerge = _get_mkvmerge()
     if mkvmerge is None:
@@ -1448,6 +1451,18 @@ class App:
                     msg_parts.append("Closed Captions Removed: Yes")
                 if s['audio_sel'] is not None:
                     msg_parts.append(f"Audio Kept: Track #{s['audio_sel']}")
+
+                # Delete original if requested
+                if s.get('delete_originals'):
+                    orig_path = os.path.abspath(s['fp'])
+                    if os.path.isfile(orig_path):
+                        try:
+                            os.remove(orig_path)
+                            msg_parts.append("Original Deleted: Yes")
+                        except OSError as e:
+                            msg_parts.append(f"Original Deleted: No ({e})")
+                    else:
+                        msg_parts.append("Original Deleted: No (file not found)")
 
                 self._process_file_result(True, " ".join(msg_parts), cb_ctx=mux_cb_ctx)
 
