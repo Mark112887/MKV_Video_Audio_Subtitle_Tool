@@ -26,6 +26,7 @@ import os
 import re
 import math
 import json
+import threading
 import msvcrt
 import _winapi
 
@@ -1378,23 +1379,56 @@ class App:
                         self._process_file_result(False, f"ffmpeg failed: {exc}", cb_ctx=mux_cb_ctx)
                         return
 
-                    # Poll CC removal with time-based estimate
+                    # Poll CC removal with time-based estimate.
+                    # A background thread drains stdout via communicate() to prevent
+                    # pipe buffer deadlocks (ffmpeg hangs when its stdout fills up) and
+                    # avoid handle-type mismatches on Windows (_winapi needs HANDLEs, not FDs).
+                    stderr_list: list[str] = []  # shared between reader and writer
+                    cc_done = threading.Event()
+
+                    def _cc_reader():
+                        """Drain merged stdout/stderr from the ffmpeg process."""
+                        try:
+                            out, _ = mux_cc_proc.communicate()
+                            if out is not None:
+                                for line in out.splitlines():
+                                    stderr_list.append(line.decode("utf-8", errors="replace"))
+                        except Exception:
+                            pass  # reader failures should not abort processing
+                        finally:
+                            cc_done.set()
+
+                    threading.Thread(target=_cc_reader, daemon=True, name="cc-reader").start()
+
                     cc_start = _time.time()
-                    while mux_cc_proc.poll() is None:
+                    while mux_cc_proc.poll() is None and not cc_done.is_set():
                         elapsed = _time.time() - cc_start
                         pct_cc = min(98, int((elapsed / cc_est) * 100)) if cc_est > 0 else 0
                         rem = max(0, cc_est - elapsed)
                         mux_cb('ffmpeg', pct_cc, f"Removing CC… {rem:.0f}s remaining")
-                        time.sleep(0.1)
+                        _time.sleep(0.1)
+
+                    # Wait for the background reader to finish collecting output
+                    # (in case process exited while we were in the last sleep iteration)
+                    cc_done.wait(timeout=5)
+                    stderr_text_lower = ''.join(stderr_list).lower()
 
                     if mux_cc_proc.returncode != 0:
-                        try:
-                            os.remove(output_path)
-                        except OSError:
-                            pass
-                        self._process_file_result(False, "Failed to remove closed captions.", cb_ctx=mux_cb_ctx)
-                        return
+                        # ffmpeg -bs:v filter_units=remove_types=6 can return non-zero when
+                        # there are no SEI (CC) frames — treat that as a no-op and continue.
+                        is_no_op = any(
+                            kw in stderr_text_lower
+                            for kw in ('not found', 'no data', 'no sei')
+                        )
+                        if not is_no_op:
+                            try:
+                                os.remove(output_path)
+                            except OSError:
+                                pass
+                            self._process_file_result(False, "Failed to remove closed captions.", cb_ctx=mux_cb_ctx)
+                            return
 
+                    # CC removal succeeded (or was a no-op — nothing to remove). Swap output into place.
                     if not os.path.exists(cc_path):
                         try:
                             os.remove(output_path)
