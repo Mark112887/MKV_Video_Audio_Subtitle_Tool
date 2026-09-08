@@ -186,9 +186,21 @@ def run_mkvtl(args, timeout=300):
         return -1, "Timeout"
 
 
-# ─── mkvmerge --gui-mode progress parser ──────────────────────
+# ─── mkvmerge --json-status progress parser ──────────────────────
 
 _gui_progress_re = re.compile(r'^#GUI#progress\s+(\d+)%')
+
+
+def _parse_json_progress(line):
+    """Parse a 'progress' field from mkvmerge --json-status JSON lines.
+
+    Returns the percentage int if found, otherwise None.
+    """
+    try:
+        data = json.loads(line)
+        return int(data.get('progress', -1)) if data.get('progress') is not None else None
+    except (json.JSONDecodeError, ValueError):
+        return None
 
 
 def _run_with_progress(args, timeout=600, callback=None):
@@ -357,8 +369,10 @@ def process_mkv(mkv_path, output_dir, dar_str="16:9", remove_subs=True,
         msg = "mkvmerge.exe not found."
         return False, msg
 
-    # Build mkvmerge args: copy tracks, optionally delete subtitles, filter audio + gui-mode
-    merge_args = ['-o', output_path, '--gui-mode']
+    # Build mkvmerge args: copy tracks, optionally delete subtitles, filter audio.
+    # Use --json-status so progress arrives even when stdout is piped (not a console),
+    # where mkvmerge suppresses #GUI#progress events and switches to batch mode.
+    merge_args = ['-o', output_path, '--json-status']
 
     if audio_sel is not None:
         merge_args += ['--audio-tracks', str(audio_sel)]
@@ -1000,10 +1014,8 @@ class App:
         self.txt.config(state="normal")
         self.txt.delete("1.0", "end")
         self.txt.config(state="disabled")
-        self.cur_canvas.create_rectangle(
-            1, 2, 519, 13, fill="#1e2130", outline="")
-        self.over_canvas.create_rectangle(
-            1, 2, 519, 13, fill="#1e2130", outline="")
+        self.cur_canvas.delete("all")
+        self.over_canvas.delete("all")
         self.cur_text.config(text="Current File: 0%")
         self.over_text.config(text="Overall: 0%")
         if not self.processing:
@@ -1190,7 +1202,7 @@ class App:
                 fname = os.path.basename(fp)
                 output_path = os.path.join(self.output_dir,
                                            os.path.splitext(fname)[0] + '.mkv')
-                merge_args = ['-o', output_path, '--gui-mode']
+                merge_args = ['-o', output_path, '--json-status']
                 if audio_sel is not None:
                     merge_args += ['--audio-tracks', str(audio_sel)]
                 if remove_subs:
@@ -1225,6 +1237,25 @@ class App:
                 s['mux_buf'] = b''
                 s['mux_events'] = []
                 s['mux_error'] = None
+                # Compute a fixed mux duration based on file size for smooth progress.
+                _fp_for_size = s.get('output_path') or s.get('fp', '')
+                try:
+                    _size_mb = max(1, os.path.getsize(_fp_for_size) / (1024 * 1024))
+                except OSError:
+                    _size_mb = 1
+                s['_fixed_mux_est'] = max(5, min(int(_size_mb / 25), 120))
+
+                start_mux_time = _time.time()  # wall-clock for time-based fallback
+                s['_mux_start_time'] = start_mux_time
+
+                # Compute a fixed mux duration based on input file size (avoids the moving-target
+                # problem where mux_est = elapsed * 3 never reaches 100%).
+                _fp_for_size = s.get('output_path') or s.get('fp', '')
+                try:
+                    _size_mb = max(1, os.path.getsize(_fp_for_size) / (1024 * 1024))
+                except OSError:
+                    _size_mb = 1
+                s['_fixed_mux_est'] = max(5, min(int(_size_mb / 25), 120))  # ~25 MB/s default
 
                 try:
                     s['mux_proc'] = subprocess.Popen(
@@ -1239,17 +1270,41 @@ class App:
                     return
 
                 # Set up callback context for real-time progress updates.
-                # The callback stores percentage in cb_ctx — the main-thread timer
-                # reads from cb_ctx and updates Tk widgets (safe: all on main thread).
-                cb_ctx = {'pct': 0}
-                s['cb_ctx'] = cb_ctx
+                # The callback draws directly to cur_canvas on the main thread via after(),
+                # so the individual file status bar fills dynamically as mkvmerge works.
+                cb_ctx = {'pct': 0, '_bar_width': 518}
 
                 def _mux_cb(step, pct=None, text=None):
-                    """Progress callback — stores percentage for the poll timer to read."""
-                    p = min(100, max(pct if pct is not None else 0, 0))
-                    cb_ctx['pct'] = int(p)
+                    """Progress callback — draws to the file progress bar on the main thread.
+
+                    Uses event-driven progress from mkvmerge when available.
+                    Falls back to a fixed-duration time estimate so the bar always moves.
+                    """
+                    elapsed = _time.time() - start_mux_time
+                    mux_est = s.get('_fixed_mux_est', 60)  # fixed duration, not growing with elapsed
+                    time_pct = min(95, int((elapsed / mux_est) * 100))
+
+                    if pct is not None:
+                        p = min(100, max(pct, 0))
+                        blended = max(time_pct, p)
+                    else:
+                        blended = time_pct
+                        p = 0
+
+                    cb_ctx['pct'] = int(blended)
+                    w = cb_ctx['_bar_width']
+                    fill = max(2, int((w - 2) * blended / 100.0))
+                    self.root.after(0, lambda ff=fill, ww=w: (
+                        self.cur_canvas.delete("fill"),
+                        self.cur_canvas.create_rectangle(1, 2, 1 + ff, ww, fill="#7ab5cf", tag="fill")
+                    ))
+                    if text is not None:
+                        self.root.after(0, lambda tt=text: self.cur_text.config(text=tt))
 
                 s['_mux_cb'] = _mux_cb
+                # Also expose mux_start_time and cb_ctx for the progress_timer callback.
+                s['_mux_start_time_ref'] = start_mux_time
+                s['_cb_ctx_ref'] = cb_ctx
 
                 # Start a polling timer that calls the callback and monitors process state.
                 # The timer runs on the main thread via after(), so all Tk updates
@@ -1284,12 +1339,19 @@ class App:
                                         line = line_bytes.decode("utf-8", errors="replace")
                                     except Exception:
                                         continue
+                                    # Try GUI progress format first, fall back to JSON
                                     m = _gui_progress_re.match(line)
+                                    pct_val = None
                                     if m:
                                         pct_val = int(m.group(1))
+                                    else:
+                                        j = _parse_json_progress(line)
+                                        if j is not None:
+                                            pct_val = j
+                                    if pct_val is not None and 0 <= pct_val <= 100:
                                         s['mux_events'].append(pct_val)
                                         if cb:
-                                            self.root.after(0, lambda p=pct_val: cb('mkvmerge', p))
+                                            self.root.after(0, lambda pp=pct_val: cb('mkvmerge', pp))
                         except OSError:
                             pass
 
@@ -1308,8 +1370,44 @@ class App:
                     s['step'] = 'MKV_POLL'
                     self.root.after(16, _start_poll)
 
+                # Independent time-based progress timer: fires every 200ms to update the
+                # individual file status bar with elapsed-time estimate. This ensures the
+                # bar fills smoothly even when mkvmerge emits no progress events.
+                def _progress_timer():
+                    if s.get('step') != 'MKV_POLL':
+                        return
+                    cb = s.get('_mux_cb')
+                    proc = s.get('mux_proc')
+                    if proc is None or proc.poll() is not None:
+                        # Muxing finished — timer will stop on next _process_step check
+                        self.root.after(200, _progress_timer)
+                        return
+                    start_t = s['_mux_start_time_ref']
+                    cb_c = s['_cb_ctx_ref']
+                    elapsed = _time.time() - start_t
+                    mux_est = s.get('_fixed_mux_est', 60)  # fixed duration, not growing with elapsed
+                    t_pct = min(95, int((elapsed / mux_est) * 100))
+                    p_old = cb_c.get('pct', 0)
+                    # Use the higher of event-driven vs time-based so we don't regress
+                    blended = max(t_pct, p_old)
+                    if blended != p_old:
+                        cb_c['pct'] = blended
+                        w = cb_c['_bar_width']
+                        fill = max(2, int((w - 2) * blended / 100.0))
+                        self.root.after(0, lambda pp=blended, ff=fill, ww=w: (
+                            self.cur_canvas.delete("fill"),
+                            self.cur_canvas.create_rectangle(
+                                1, 2, 1 + ff, ww, fill="#7ab5cf", tag="fill"
+                            ),
+                            self.cur_text.config(text=f"Current File: {pp}%")
+                        ))
+                    # Schedule next timer
+                    self.root.after(200, _progress_timer)
+
                 s['step'] = 'MKV_POLL'
                 self.root.after(0, _start_poll)
+                # Kick off the time-based progress timer immediately.
+                self.root.after(0, _progress_timer)
 
                 # Schedule the next step to handle process completion.
                 # This fires immediately but will wait until after any pending
@@ -1331,19 +1429,58 @@ class App:
                 events = s.get('mux_events', [])
                 last_pct = cb_ctx.get('pct', 0)
 
-                # Final canvas update with captured percentage
-                self.root.after(0, lambda lp=last_pct: (
-                    self.cur_canvas.create_rectangle(1, 2, 1 + max(2, int((self.cur_canvas.winfo_width() - 2) * lp / 100.0)), 13, fill="#7ab5cf", outline="")
-                ) if lp > 0 else None)
-                self.root.after(0, lambda lp=last_pct:
-                               self.cur_text.config(text=f"Current File: {lp}%") if lp > 0 else None)
+                # Final canvas update with captured percentage.
+                # If no progress events arrived (last_pct == 0), fall back to time-based
+                # estimate so the bar still reflects elapsed time.
+                mux_start = s.get('_mux_start_time')
+                if mux_start:
+                    elapsed = _time.time() - mux_start
+                    mux_est = s.get('_fixed_mux_est', 60)  # fixed duration for consistent progress
+                    last_pct = max(last_pct, min(95, int((elapsed / mux_est) * 100)))
 
-                # Build final callback message for remaining steps
+                # Final canvas update with captured percentage.
+                # Always draw to the individual file status bar so it reflects
+                # whatever progress was captured (even 0 if mkvmerge had no output).
+                self.root.after(0, lambda lp=last_pct: (
+                    self.cur_canvas.delete("fill"),
+                    self.cur_canvas.create_rectangle(1, 2, 1 + max(2, int((self.cur_canvas.winfo_width() - 2) * lp / 100.0)), 13, fill="#7ab5cf", tag="fill"),
+                ))
+                self.root.after(0, lambda lp=last_pct:
+                               self.cur_text.config(text=f"Current File: {lp}%"))
+
+                # Build final callback message for remaining steps (CC removal + mkvpropedit).
+                # These callbacks also draw to cur_canvas so the bar keeps moving.
                 def _build_cb_for_remaining():
                     cb_ctx_local = {'pct': last_pct}
+
                     def _cb(st, pct=None, text=None):
-                        p = min(100, max(pct if pct is not None else 0, 0))
-                        cb_ctx_local['pct'] = int(p)
+                        # Use a fixed-duration estimate so progress climbs smoothly to 100%.
+                        elapsed = _time.time() - mux_start
+                        mux_est = s.get('_fixed_mux_est', 60)
+                        time_pct = min(95, int((elapsed / mux_est) * 100))
+
+                        if pct is not None:
+                            p = min(100, max(pct, 0))
+                            blended = max(time_pct, p)
+                        else:
+                            blended = time_pct
+                            p = last_pct
+
+                        cb_ctx_local['pct'] = int(blended)
+
+                        # Draw to individual file status bar on main thread.
+                        self.root.after(0, lambda pp=blended: (
+                            self.cur_canvas.delete("fill"),
+                            self.cur_canvas.create_rectangle(
+                                1, 2,
+                                1 + max(2, int((518 - 2) * pp / 100.0)),
+                                13, fill="#7ab5cf", tag="fill"
+                            ),
+                        ))
+                        self.root.after(0, lambda pp=blended:
+                                       self.cur_text.config(text=f"Current File: {pp}%"))
+                        if text is not None:
+                            self.root.after(0, lambda tt=text: self.cur_text.config(text=tt))
                     return _cb, cb_ctx_local
 
                 mux_cb, mux_cb_ctx = _build_cb_for_remaining()
@@ -1406,6 +1543,7 @@ class App:
                         pct_cc = min(98, int((elapsed / cc_est) * 100)) if cc_est > 0 else 0
                         rem = max(0, cc_est - elapsed)
                         mux_cb('ffmpeg', pct_cc, f"Removing CC… {rem:.0f}s remaining")
+                        self.root.update_idletasks()
                         _time.sleep(0.1)
 
                     # Wait for the background reader to finish collecting output
@@ -1447,10 +1585,22 @@ class App:
 
                 # ─── mkvpropedit step ───
                 dar_w, dar_h = parse_dar(s['dar_str'])
-                mux_cb('mkvpropedit', 99, "Setting metadata…")
-                mux_cb('done', 100)
-
                 mkvpropedit = _get_mkvpropedit()
+                mkv_prop_start = _time.time()
+                mux_cb('mkvpropedit', 99, "Setting metadata…")
+
+                # Give Tk time to render the initial progress state before running
+                mkv_est = max(1, (_time.time() - mkv_prop_start) * 3) if mkv_prop_start else 1
+                sleep_target = max(0, min(0.8, mkv_est - (_time.time() - mkv_prop_start)))
+                while sleep_target > 0.02:
+                    elapsed = _time.time() - mkv_prop_start
+                    pct_pe = min(96, int((elapsed / mkv_est) * 100)) if mkv_est > 0 else 0
+                    mux_cb('mkvpropedit', pct_pe, f"Setting metadata… {elapsed:.1f}s")
+                    self.root.update_idletasks()
+                    _time.sleep(0.05)
+                    sleep_target = max(0, min(0.8, mkv_est - (_time.time() - mkv_prop_start)))
+
+                mux_cb('done', 100)
                 if mkvpropedit is None:
                     try:
                         os.remove(output_path)
